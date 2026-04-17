@@ -533,3 +533,9 @@ def _export_ply_ascii_base64(food_pts: np.ndarray) -> str:
         lines.append(f"{pt[0]:.6f} {pt[1]:.6f} {pt[2]:.6f}")
     ply_bytes = "\n".join(lines).encode("utf-8")
     return base64.b64encode(ply_bytes).decode("utf-8")
+
+
+if __name__ == "__main__":
+    import uvicorn
+    port = int(os.environ.get("PORT", 8000))
+    uvicorn.run(app, host="0.0.0.0", port=port)
