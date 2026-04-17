@@ -1,0 +1,8 @@
+fastapi==0.115.0
+uvicorn[standard]==0.30.6
+numpy==1.26.4
+scipy==1.13.1
+open3d==0.18.0
+trimesh==4.4.3
+scikit-learn==1.5.1
+python-multipart==0.0.9
