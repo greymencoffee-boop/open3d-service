@@ -1,6 +1,7 @@
 """
 open3d-service/main.py
 FastAPI service for processing LiDAR depth maps into volumetric estimates.
+Pipeline aligned with LiDARCalorieCam (Fujita & Yanai, 2025).
 """
 
 import base64
@@ -47,12 +48,13 @@ except Exception as _e:
     logger.warning("trimesh not available: %s", _e)
 
 try:
-    from scipy.spatial import ConvexHull
+    from scipy.spatial import ConvexHull, Delaunay
 
     SCIPY_AVAILABLE = True
     logger.info("scipy loaded successfully")
 except Exception as _e:
     ConvexHull = None  # type: ignore[assignment]
+    Delaunay = None    # type: ignore[assignment]
     SCIPY_AVAILABLE = False
     logger.warning("scipy not available: %s", _e)
 
@@ -79,9 +81,52 @@ DEFAULT_INTRINSICS = [55.0, 55.0, 32.0, 24.0]  # fx, fy, cx, cy
 
 MIN_VALID_POINTS = 50
 MIN_FOOD_POINTS = 20
-TABLE_MARGIN_M = 0.005  # 5 mm above table plane
-VOXEL_SIZE = 0.004      # 4 mm
-FOOD_FILL_RATIO = 0.55  # food is ~55 % of its convex hull
+TABLE_MARGIN_M = 0.005   # 5 mm above table plane
+
+# ---------------------------------------------------------------------------
+# Per-category linear regression: W_grams = a * vol_ml + b
+# Coefficients from LiDARCalorieCam paper Table 1 (Japanese foods) +
+# density-derived approximations for common Western foods.
+# ---------------------------------------------------------------------------
+
+CATEGORY_REGRESSION: dict[str, tuple[float, float]] = {
+    # Paper's 10 Japanese categories
+    "karaage":            (0.45, 11.4),
+    "croquette":          (0.52,  8.7),
+    "yakitori":           (0.48,  6.2),
+    "hot dog":            (0.61,  5.1),
+    "toast":              (0.38,  4.9),
+    "yakisoba":           (0.44, 12.1),
+    "potato salad":       (0.57,  9.3),
+    "onigiri":            (0.71,  3.8),
+    "tamagoyaki":         (0.82,  2.6),
+    "sauteed vegetables": (0.35, 15.2),
+    # Common Western foods (density-derived approximations)
+    "chicken":            (0.45, 11.0),
+    "rice":               (0.70,  4.0),
+    "salad":              (0.30, 15.0),
+    "bread":              (0.38,  5.0),
+    "egg":                (0.82,  2.5),
+    "pasta":              (0.44, 12.0),
+    "noodle":             (0.44, 12.0),
+    "potato":             (0.57,  9.0),
+    "steak":              (0.55,  8.0),
+    "fish":               (0.50,  7.0),
+}
+
+
+def _estimate_weight(
+    vol_ml: float, category: Optional[str]
+) -> tuple[Optional[float], Optional[str]]:
+    """Return (weight_g, matched_category_key) via fuzzy substring match."""
+    if not category:
+        return None, None
+    key = category.lower().strip()
+    for cat_key, (a, b) in CATEGORY_REGRESSION.items():
+        if cat_key in key or key in cat_key:
+            return round(a * vol_ml + b, 1), cat_key
+    return None, None
+
 
 # ---------------------------------------------------------------------------
 # Pydantic models
@@ -92,6 +137,7 @@ class ProcessRequest(BaseModel):
     depthMapBase64: str
     intrinsics: Optional[list[float]] = Field(default=None)
     scanId: str = ""
+    category: Optional[str] = None   # food name for per-category regression
 
 
 class ProcessResponse(BaseModel):
@@ -99,6 +145,8 @@ class ProcessResponse(BaseModel):
     methodBreakdown: dict[str, Any] = {}
     confidence: Optional[float] = None
     plyBase64: Optional[str] = None
+    estimatedWeightG: Optional[float] = None    # from W = aV + b regression
+    regressionCategory: Optional[str] = None   # matched regression key
     error: Optional[str] = None
     timedOut: bool = False
 
@@ -107,7 +155,7 @@ class ProcessResponse(BaseModel):
 # FastAPI app
 # ---------------------------------------------------------------------------
 
-app = FastAPI(title="LiDAR Depth-Map Processor", version="1.0.0")
+app = FastAPI(title="LiDAR Depth-Map Processor", version="2.0.0")
 
 # Read at startup — Railway injects this as a service variable.
 _SERVICE_SECRET_KEY: str | None = os.environ.get("SERVICE_SECRET_KEY")
@@ -176,7 +224,7 @@ def _run_pipeline(req: ProcessRequest) -> ProcessResponse:
             timedOut=False,
         )
 
-    # 3. DBSCAN noise removal
+    # 3. DBSCAN noise removal (paper: ε=5 mm, minPts=5)
     points = _denoise_dbscan(points)
 
     if points.shape[0] < MIN_VALID_POINTS:
@@ -190,65 +238,75 @@ def _run_pipeline(req: ProcessRequest) -> ProcessResponse:
     food_mask = points[:, 1] > (table_y + TABLE_MARGIN_M)
     food_pts = points[food_mask]
 
-    low_confidence_base = food_pts.shape[0] < MIN_FOOD_POINTS
-    if low_confidence_base:
+    low_pt_flag = food_pts.shape[0] < MIN_FOOD_POINTS
+    if low_pt_flag:
         logger.warning(
-            "Only %d food points found (< %d); proceeding with low confidence",
+            "Only %d food points found (< %d); proceeding with all points",
             food_pts.shape[0],
             MIN_FOOD_POINTS,
         )
-        # Use all points as a fallback so we still get a result
         food_pts = points
 
-    # 5. Volume methods
+    # Build Open3D point cloud once (used by methods 3 and 5)
+    pcd = _make_pcd(food_pts)
+
+    # 5. Run the paper's 5 volume methods
     breakdown: dict[str, Any] = {}
 
-    m1 = _method_depth_projection(food_pts, table_y)
-    breakdown["depth_projection"] = round(m1, 2) if m1 is not None else None
+    m_convex   = _method_convex(food_pts)
+    m_delaunay = _method_delaunay(food_pts)
+    m_alpha    = _method_alpha_shape(pcd)
+    m_spline   = _method_spline(food_pts)
+    m_poisson  = _method_poisson(pcd)
 
-    m2 = _method_voxel_grid(food_pts)
-    breakdown["voxel_grid"] = round(m2, 2) if m2 is not None else None
+    breakdown["convex"]   = round(m_convex,   2) if m_convex   is not None else None
+    breakdown["delaunay"] = round(m_delaunay, 2) if m_delaunay is not None else None
+    breakdown["alpha"]    = round(m_alpha,    2) if m_alpha    is not None else None
+    breakdown["spline"]   = round(m_spline,   2) if m_spline   is not None else None
+    breakdown["poisson"]  = round(m_poisson,  2) if m_poisson  is not None else None
 
-    m3 = _method_convex_hull_3d(food_pts)
-    breakdown["convex_hull_3d"] = round(m3, 2) if m3 is not None else None
+    # 6. Paper ensemble: confidence = exp(−σ/μ)
+    valid = {k: v for k, v in breakdown.items() if v is not None and 40.0 < v < 1600.0}
 
-    m4 = _method_alpha_shape(food_pts)
-    breakdown["alpha_shape"] = round(m4, 2) if m4 is not None else None
-
-    m5 = _method_poisson(food_pts)
-    breakdown["poisson"] = round(m5, 2) if m5 is not None else None
-
-    # 6. Ensemble
-    candidates = [
-        v for v in [m1, m2, m3, m4, m5] if v is not None and 40.0 < v < 1600.0
-    ]
-
-    if not candidates:
+    if not valid:
         return ProcessResponse(
             error="All volume methods failed or produced out-of-range estimates",
             methodBreakdown=breakdown,
             timedOut=False,
         )
 
-    if len(candidates) >= 3:
-        s = sorted(candidates)
-        trimmed = s[1:-1]
-        final_vol = sum(trimmed) / len(trimmed)
-    else:
-        final_vol = sum(candidates) / len(candidates)
+    vals      = list(valid.values())
+    mu        = float(np.mean(vals))
+    sigma     = float(np.std(vals))
+    cv        = sigma / mu if mu > 0 else 1.0
+    confidence = float(np.exp(-cv))   # paper formula
 
-    # 7. Confidence
-    confidence = _compute_confidence(candidates, final_vol, low_confidence_base)
+    # Paper's selection rule
+    if confidence >= 0.8 and valid.get("poisson") is not None:
+        final_vol = float(valid["poisson"])
+    elif valid.get("convex") is not None:
+        final_vol = float(valid["convex"])
+    else:
+        final_vol = mu
+
+    # Clamp confidence if we had very few food points
+    if low_pt_flag:
+        confidence = max(0.30, confidence - 0.15)
+
+    # 7. Per-category weight regression
+    weight_g, matched_cat = _estimate_weight(final_vol, req.category)
 
     # 8. PLY export
     ply_b64 = _export_ply_base64(food_pts)
 
     logger.info(
-        "Scan %s complete — vol=%.1f ml conf=%.2f methods=%d",
+        "Scan %s → vol=%.1f ml conf=%.2f methods=%d/%d%s",
         req.scanId or "<no-id>",
         final_vol,
         confidence,
-        len(candidates),
+        len(valid),
+        5,
+        f" weight={weight_g}g ({matched_cat})" if weight_g else "",
     )
 
     return ProcessResponse(
@@ -256,6 +314,8 @@ def _run_pipeline(req: ProcessRequest) -> ProcessResponse:
         methodBreakdown=breakdown,
         confidence=round(confidence, 3),
         plyBase64=ply_b64,
+        estimatedWeightG=weight_g,
+        regressionCategory=matched_cat,
     )
 
 
@@ -267,43 +327,52 @@ def _run_pipeline(req: ProcessRequest) -> ProcessResponse:
 def _backproject(
     depth: np.ndarray, fx: float, fy: float, cx: float, cy: float
 ) -> np.ndarray:
-    """Pinhole back-projection. Returns Nx3 float32 world points (y-up).
-
-    Spec math (step-by-step):
-      zCam = -d
-      xCam = (ox - cx) / fx * d
-      yCam = -(oy - cy) / fy * d          <- image row 0 is top; negate so up = -row
-      y_world = -yCam                     <- negate again so world y is upward-positive
-               = (oy - cy) / fy * d       <- the two negations cancel
-    """
-    rows, cols = np.indices(depth.shape)  # each (H, W)
+    """Pinhole back-projection. Returns Nx3 float32 world points (y-up)."""
+    rows, cols = np.indices(depth.shape)
     valid = ~np.isnan(depth)
 
-    d = depth[valid].astype(np.float32)
+    d  = depth[valid].astype(np.float32)
     ox = cols[valid].astype(np.float32)
     oy = rows[valid].astype(np.float32)
 
     x_world = (ox - cx) / fx * d
-    y_world = (oy - cy) / fy * d  # double-negation → upward positive
+    y_world = (oy - cy) / fy * d   # double-negation → upward positive
     z_world = -d
 
-    pts = np.stack([x_world, y_world, z_world], axis=1)
-    return pts
+    return np.stack([x_world, y_world, z_world], axis=1)
+
+
+def _make_pcd(food_pts: np.ndarray):
+    """Build an Open3D PointCloud with estimated normals (needed by alpha + poisson)."""
+    if not OPEN3D_AVAILABLE:
+        return None
+    pcd = o3d.geometry.PointCloud()
+    pcd.points = o3d.utility.Vector3dVector(food_pts.astype(np.float64))
+    pcd.estimate_normals()
+    return pcd
 
 
 def _denoise_dbscan(points: np.ndarray) -> np.ndarray:
-    """DBSCAN noise removal — keep largest cluster. Falls back to all points."""
+    """DBSCAN noise removal — paper params: ε=5 mm, minPts=5. Keep largest cluster."""
     if not SKLEARN_AVAILABLE or points.shape[0] < MIN_VALID_POINTS:
         return points
 
     try:
-        labels = DBSCAN(eps=0.012, min_samples=8).fit_predict(points)
+        labels = DBSCAN(eps=0.005, min_samples=5).fit_predict(points)
         unique, counts = np.unique(labels[labels >= 0], return_counts=True)
         if len(unique) == 0:
             logger.warning("DBSCAN found no clusters — using all points")
             return points
+        # Paper: if >50% removed, fall back to raw cloud
         largest = unique[np.argmax(counts)]
         filtered = points[labels == largest]
+        removal_frac = 1.0 - filtered.shape[0] / points.shape[0]
+        if removal_frac > 0.5:
+            logger.warning(
+                "DBSCAN removed %.0f%% of points — using raw cloud (paper fallback)",
+                removal_frac * 100,
+            )
+            return points
         logger.info(
             "DBSCAN: %d → %d points (largest cluster)", points.shape[0], filtered.shape[0]
         )
@@ -314,130 +383,128 @@ def _denoise_dbscan(points: np.ndarray) -> np.ndarray:
 
 
 # ---------------------------------------------------------------------------
-# Volume methods (each returns ml or None)
+# Volume methods — paper's exact 5 (each returns ml or None)
 # ---------------------------------------------------------------------------
 
 
-def _method_depth_projection(food_pts: np.ndarray, table_y: float) -> Optional[float]:
-    """Method 1 — depth projection via 2-D convex hull."""
+def _method_convex(food_pts: np.ndarray) -> Optional[float]:
+    """Method 1 — scipy 3-D convex hull volume (no fill-ratio correction)."""
     if not SCIPY_AVAILABLE:
-        logger.warning("Method 1 skipped: scipy not available")
-        return None
-    try:
-        xz = food_pts[:, [0, 2]]
-        if xz.shape[0] < 4:
-            return None
-        hull = ConvexHull(xz)
-        area_m2 = hull.volume  # ConvexHull.volume = area in 2-D
-        height_m = float(np.mean(food_pts[:, 1]) - table_y)
-        if height_m <= 0:
-            height_m = float(np.abs(np.max(food_pts[:, 1]) - np.min(food_pts[:, 1])))
-        vol_ml = area_m2 * height_m * 1e6
-        logger.info("Method 1 (depth_projection): %.2f ml", vol_ml)
-        return float(vol_ml)
-    except Exception:
-        logger.warning("Method 1 (depth_projection) failed:\n%s", traceback.format_exc())
-        return None
-
-
-def _method_voxel_grid(food_pts: np.ndarray) -> Optional[float]:
-    """Method 2 — voxel grid occupancy (open3d)."""
-    if not OPEN3D_AVAILABLE:
-        logger.warning("Method 2 skipped: open3d not available")
-        return None
-    try:
-        pcd = o3d.geometry.PointCloud()
-        pcd.points = o3d.utility.Vector3dVector(food_pts.astype(np.float64))
-        voxel_grid = o3d.geometry.VoxelGrid.create_from_point_cloud(
-            pcd, voxel_size=VOXEL_SIZE
-        )
-        voxels = voxel_grid.get_voxels()
-        n_voxels = len(voxels)
-        vol_ml = n_voxels * (VOXEL_SIZE**3) * 1e6
-        logger.info("Method 2 (voxel_grid): %d voxels → %.2f ml", n_voxels, vol_ml)
-        return float(vol_ml)
-    except Exception:
-        logger.warning("Method 2 (voxel_grid) failed:\n%s", traceback.format_exc())
-        return None
-
-
-def _method_convex_hull_3d(food_pts: np.ndarray) -> Optional[float]:
-    """Method 3 — scipy 3-D convex hull × 0.55."""
-    if not SCIPY_AVAILABLE:
-        logger.warning("Method 3 skipped: scipy not available")
+        logger.warning("Method 1 (convex) skipped: scipy not available")
         return None
     try:
         if food_pts.shape[0] < 5:
             return None
         hull = ConvexHull(food_pts)
-        vol_ml = hull.volume * FOOD_FILL_RATIO * 1e6
-        logger.info("Method 3 (convex_hull_3d): %.2f ml", vol_ml)
+        vol_ml = hull.volume * 1e6   # m³ → ml
+        logger.info("Method 1 (convex): %.2f ml", vol_ml)
         return float(vol_ml)
     except Exception:
-        logger.warning("Method 3 (convex_hull_3d) failed:\n%s", traceback.format_exc())
+        logger.warning("Method 1 (convex) failed:\n%s", traceback.format_exc())
         return None
 
 
-def _method_alpha_shape(food_pts: np.ndarray) -> Optional[float]:
-    """Method 4 — BPA mesh (open3d) or trimesh convex hull × 0.55 fallback."""
-    # Attempt open3d BPA first
-    if OPEN3D_AVAILABLE:
-        try:
-            pcd = o3d.geometry.PointCloud()
-            pcd.points = o3d.utility.Vector3dVector(food_pts.astype(np.float64))
-            pcd.estimate_normals()
-            radii = [0.01, 0.02, 0.04]
-            mesh = o3d.geometry.TriangleMesh.create_from_point_cloud_ball_pivoting(
-                pcd, o3d.utility.DoubleVector(radii)
-            )
-            if mesh.is_watertight():
-                vol_ml = float(mesh.get_volume()) * 1e6
-                logger.info("Method 4 (BPA mesh): %.2f ml", vol_ml)
-                return vol_ml
-            else:
-                logger.warning("Method 4: BPA mesh not watertight — falling back")
-        except Exception:
-            logger.warning("Method 4 (BPA) failed:\n%s", traceback.format_exc())
-
-    # Fallback: trimesh convex hull × 0.55
-    if TRIMESH_AVAILABLE:
-        try:
-            pc = trimesh.PointCloud(food_pts.astype(np.float64))
-            hull = pc.convex_hull
-            vol_ml = float(hull.volume) * FOOD_FILL_RATIO * 1e6
-            logger.info("Method 4 (trimesh convex hull proxy): %.2f ml", vol_ml)
-            return vol_ml
-        except Exception:
-            logger.warning(
-                "Method 4 (trimesh fallback) failed:\n%s", traceback.format_exc()
-            )
-
-    logger.warning("Method 4 skipped: no suitable library available")
-    return None
-
-
-def _method_poisson(food_pts: np.ndarray) -> Optional[float]:
-    """Method 5 — Poisson surface reconstruction (open3d)."""
-    if not OPEN3D_AVAILABLE:
-        logger.warning("Method 5 skipped: open3d not available")
+def _method_delaunay(food_pts: np.ndarray) -> Optional[float]:
+    """Method 2 — Delaunay tetrahedral decomposition volume."""
+    if not SCIPY_AVAILABLE:
+        logger.warning("Method 2 (delaunay) skipped: scipy not available")
         return None
     try:
-        pcd = o3d.geometry.PointCloud()
-        pcd.points = o3d.utility.Vector3dVector(food_pts.astype(np.float64))
-        pcd.estimate_normals()
+        if food_pts.shape[0] < 5:
+            return None
+        tri = Delaunay(food_pts)
+        tetra = food_pts[tri.simplices]   # (N_tetra, 4, 3)
+        a = tetra[:, 1] - tetra[:, 0]
+        b = tetra[:, 2] - tetra[:, 0]
+        c = tetra[:, 3] - tetra[:, 0]
+        vols = np.abs(np.einsum("ni,ni->n", a, np.cross(b, c))) / 6.0
+        vol_ml = float(np.sum(vols)) * 1e6
+        logger.info("Method 2 (delaunay): %.2f ml", vol_ml)
+        return vol_ml
+    except Exception:
+        logger.warning("Method 2 (delaunay) failed:\n%s", traceback.format_exc())
+        return None
 
+
+def _method_alpha_shape(pcd) -> Optional[float]:
+    """Method 3 — Open3D alpha shape (α=0.5) surface reconstruction."""
+    if not OPEN3D_AVAILABLE or pcd is None:
+        logger.warning("Method 3 (alpha_shape) skipped: open3d not available")
+        return None
+    try:
+        mesh = o3d.geometry.TriangleMesh.create_from_point_cloud_alpha_shape(
+            pcd, alpha=0.5
+        )
+        if not mesh.is_watertight():
+            logger.warning("Method 3 (alpha_shape): mesh not watertight — skipping")
+            return None
+        vol_ml = float(mesh.get_volume()) * 1e6
+        logger.info("Method 3 (alpha_shape): %.2f ml", vol_ml)
+        return vol_ml
+    except Exception:
+        logger.warning("Method 3 (alpha_shape) failed:\n%s", traceback.format_exc())
+        return None
+
+
+def _method_spline(food_pts: np.ndarray, n_slices: int = 30) -> Optional[float]:
+    """Method 4 — slice integration along Y axis (spline/trapz).
+
+    Slices the point cloud into n_slices horizontal slabs, computes the 2-D
+    convex hull area of each slab's XZ cross-section, then integrates via
+    np.trapz to get volume.
+    """
+    if not SCIPY_AVAILABLE:
+        logger.warning("Method 4 (spline) skipped: scipy not available")
+        return None
+    try:
+        y = food_pts[:, 1]
+        y_min, y_max = float(y.min()), float(y.max())
+        if y_max - y_min < 0.001:   # < 1 mm height — degenerate
+            return None
+
+        edges = np.linspace(y_min, y_max, n_slices + 1)
+        areas: list[float] = []
+        ys: list[float] = []
+
+        for i in range(n_slices):
+            mask = (y >= edges[i]) & (y < edges[i + 1])
+            if mask.sum() < 3:
+                continue
+            xz = food_pts[mask][:, [0, 2]]
+            try:
+                areas.append(float(ConvexHull(xz).volume))   # 2-D hull → area m²
+                ys.append((edges[i] + edges[i + 1]) / 2)
+            except Exception:
+                pass   # skip degenerate slices
+
+        if len(areas) < 2:
+            return None
+
+        vol_ml = float(np.trapz(areas, ys)) * 1e6
+        logger.info("Method 4 (spline): %.2f ml (%d slices)", vol_ml, len(areas))
+        return vol_ml
+    except Exception:
+        logger.warning("Method 4 (spline) failed:\n%s", traceback.format_exc())
+        return None
+
+
+def _method_poisson(pcd) -> Optional[float]:
+    """Method 5 — Poisson surface reconstruction (depth=9, paper preferred method)."""
+    if not OPEN3D_AVAILABLE or pcd is None:
+        logger.warning("Method 5 (poisson) skipped: open3d not available")
+        return None
+    try:
         mesh, densities = o3d.geometry.TriangleMesh.create_from_point_cloud_poisson(
-            pcd, depth=6
+            pcd, depth=9
         )
         densities_np = np.asarray(densities)
         threshold = np.quantile(densities_np, 0.1)
-        # remove_vertices_by_mask removes vertices where mask[i] is True,
-        # so pass True for low-density (unwanted) vertices.
+        # remove_vertices_by_mask: True = remove (i.e. low-density vertices)
         remove_mask = (densities_np <= threshold).tolist()
         mesh.remove_vertices_by_mask(remove_mask)
 
         if not mesh.is_watertight():
-            logger.warning("Method 5: Poisson mesh not watertight after cleanup")
+            logger.warning("Method 5 (poisson): mesh not watertight after cleanup")
             return None
 
         vol_ml = float(mesh.get_volume()) * 1e6
@@ -449,41 +516,13 @@ def _method_poisson(food_pts: np.ndarray) -> Optional[float]:
 
 
 # ---------------------------------------------------------------------------
-# Confidence
-# ---------------------------------------------------------------------------
-
-
-def _compute_confidence(
-    candidates: list[float], final_vol: float, low_pt_flag: bool
-) -> float:
-    base_conf = 0.70
-
-    if len(candidates) >= 4:
-        base_conf += 0.10
-
-    spread = max(candidates) - min(candidates)
-    rel_spread = spread / final_vol if final_vol > 0 else 1.0
-
-    if rel_spread < 0.15:
-        base_conf += 0.10
-    elif rel_spread > 0.40:
-        base_conf -= 0.10
-
-    if low_pt_flag:
-        base_conf -= 0.15
-
-    return float(max(0.30, min(0.95, base_conf)))
-
-
-# ---------------------------------------------------------------------------
 # PLY export
 # ---------------------------------------------------------------------------
 
 
 def _export_ply_base64(food_pts: np.ndarray) -> Optional[str]:
-    """Export food_pts as a compressed binary little-endian PLY and return base64."""
+    """Export food_pts as a compressed binary PLY and return base64."""
     if not OPEN3D_AVAILABLE:
-        # Fallback: write a minimal ASCII PLY manually
         try:
             return _export_ply_ascii_base64(food_pts)
         except Exception:
@@ -494,14 +533,11 @@ def _export_ply_base64(food_pts: np.ndarray) -> Optional[str]:
         pcd = o3d.geometry.PointCloud()
         pcd.points = o3d.utility.Vector3dVector(food_pts.astype(np.float64))
 
-        # Write to a temp file, then read back bytes
         with tempfile.NamedTemporaryFile(suffix=".ply", delete=False) as tmp:
             tmp_path = tmp.name
 
         try:
-            o3d.io.write_point_cloud(
-                tmp_path, pcd, write_ascii=False, compressed=True
-            )
+            o3d.io.write_point_cloud(tmp_path, pcd, write_ascii=False, compressed=True)
             with open(tmp_path, "rb") as f:
                 ply_bytes = f.read()
         finally:
@@ -510,16 +546,14 @@ def _export_ply_base64(food_pts: np.ndarray) -> Optional[str]:
         return base64.b64encode(ply_bytes).decode("utf-8")
     except Exception:
         logger.warning("PLY export (open3d) failed:\n%s", traceback.format_exc())
-        # Fallback
         try:
             return _export_ply_ascii_base64(food_pts)
         except Exception:
-            logger.warning("PLY ASCII fallback also failed")
             return None
 
 
 def _export_ply_ascii_base64(food_pts: np.ndarray) -> str:
-    """Minimal ASCII PLY as a fallback when open3d is unavailable."""
+    """Minimal ASCII PLY fallback."""
     lines = [
         "ply",
         "format ascii 1.0",
