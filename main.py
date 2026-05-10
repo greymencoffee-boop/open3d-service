@@ -1,6 +1,7 @@
 """
-open3d-service/main.py
-FastAPI service for processing LiDAR depth maps into volumetric estimates.
+open3d-service/main.py  v6
+FastAPI service: LiDAR depth maps + Neural Depth (Depth Anything v2) → volumetric estimates.
+Endpoints: /health  /process  /process-photo  /warmup
 Pipeline aligned with LiDARCalorieCam (Fujita & Yanai, 2025).
 """
 
@@ -8,6 +9,7 @@ import base64
 import logging
 import os
 import tempfile
+import threading
 import traceback
 from typing import Any, Optional
 
@@ -67,6 +69,55 @@ except Exception as _e:
     DBSCAN = None  # type: ignore[assignment]
     SKLEARN_AVAILABLE = False
     logger.warning("scikit-learn not available: %s", _e)
+
+try:
+    import io as _io
+    import torch
+    from PIL import Image as PILImage
+    from transformers import AutoImageProcessor, AutoModelForDepthEstimation
+
+    DEPTH_ANYTHING_AVAILABLE = True
+    logger.info("Depth Anything v2 imports ready")
+except Exception as _e:
+    _io = None         # type: ignore[assignment]
+    torch = None       # type: ignore[assignment]
+    PILImage = None    # type: ignore[assignment]
+    AutoImageProcessor = None           # type: ignore[assignment]
+    AutoModelForDepthEstimation = None  # type: ignore[assignment]
+    DEPTH_ANYTHING_AVAILABLE = False
+    logger.warning("Depth Anything v2 not available: %s", _e)
+
+# Singletons — loaded once, reused across all requests.
+_DA_PROCESSOR = None
+_DA_MODEL = None
+_DA_LOCK = threading.Lock()   # prevents double-load under concurrent requests
+
+
+def _get_da_model():
+    """Load Depth Anything v2 Metric Indoor Small (thread-safe, cached after first call)."""
+    global _DA_PROCESSOR, _DA_MODEL
+    if _DA_PROCESSOR is not None:
+        return _DA_PROCESSOR, _DA_MODEL
+    with _DA_LOCK:
+        if _DA_PROCESSOR is None:  # double-checked locking
+            logger.info("Loading Depth Anything v2 model...")
+            _DA_PROCESSOR = AutoImageProcessor.from_pretrained(
+                "depth-anything/Depth-Anything-V2-Metric-Indoor-Small-hf"
+            )
+            _DA_MODEL = AutoModelForDepthEstimation.from_pretrained(
+                "depth-anything/Depth-Anything-V2-Metric-Indoor-Small-hf"
+            )
+            _DA_MODEL.eval()
+            logger.info("Depth Anything v2 model ready.")
+    return _DA_PROCESSOR, _DA_MODEL
+
+
+# Background preload — starts downloading the model the moment the container
+# starts, so by the time the first user request arrives the model is ready.
+if DEPTH_ANYTHING_AVAILABLE:
+    _preload = threading.Thread(target=_get_da_model, daemon=True, name="da-preload")
+    _preload.start()
+
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -149,13 +200,28 @@ class ProcessResponse(BaseModel):
     regressionCategory: Optional[str] = None   # matched regression key
     error: Optional[str] = None
     timedOut: bool = False
+    depthRawBase64: Optional[str] = None        # compact 64×48 uint8 — same format as LiDAR
+    depthHeatmapBase64: Optional[str] = None    # colorized JPEG heatmap for Claude visual context
+    # Iteration 14 Layer 6 — fractional spread (max - min) / max across the valid
+    # ensemble methods. Same semantic as LiDAR's divergence field. Drives the
+    # client-side ENSEMBLE AGREEMENT / DIVERGENCE language in the Claude prompt.
+    # Low (< 0.20) = methods agree → trust volume. High (> 0.50) = methods
+    # disagree → AI prefers visual estimate (Universal Accuracy Rules Step 6).
+    divergence: Optional[float] = None
+
+
+class ProcessPhotoRequest(BaseModel):
+    imageBase64: str            # Base64-encoded JPEG from the phone camera
+    scanId: str = ""
+    category: Optional[str] = None   # food name for weight regression
 
 
 # ---------------------------------------------------------------------------
 # FastAPI app
 # ---------------------------------------------------------------------------
 
-app = FastAPI(title="LiDAR Depth-Map Processor", version="2.0.0")
+app = FastAPI(title="LiDAR Depth-Map Processor", version="6.0.0")
+logger.info("open3d-service v6 starting — endpoints: /health /process /process-photo /warmup")
 
 # Read at startup — Railway injects this as a service variable.
 _SERVICE_SECRET_KEY: str | None = os.environ.get("SERVICE_SECRET_KEY")
@@ -164,6 +230,23 @@ _SERVICE_SECRET_KEY: str | None = os.environ.get("SERVICE_SECRET_KEY")
 @app.get("/health")
 def health() -> dict[str, str]:
     return {"status": "ok"}
+
+
+@app.get("/warmup")
+def warmup() -> dict[str, object]:
+    """Wake the container and report whether the Depth Anything model is ready.
+    Called by the client when the user enters Neural Depth Scan mode, giving the
+    model ~10-20 s to finish loading before the photo is taken."""
+    ready = _DA_PROCESSOR is not None
+    if DEPTH_ANYTHING_AVAILABLE and not ready:
+        logger.info("/warmup called — model still loading in background thread")
+    elif DEPTH_ANYTHING_AVAILABLE and ready:
+        logger.info("/warmup called — model already ready")
+    return {
+        "status": "ok",
+        "model_ready": ready,
+        "depth_anything_available": DEPTH_ANYTHING_AVAILABLE,
+    }
 
 
 @app.post("/process", response_model=ProcessResponse)
@@ -175,7 +258,7 @@ def process(req: ProcessRequest, request: Request) -> ProcessResponse:
             return JSONResponse(status_code=401, content={"error": "Unauthorized"})
 
     scan_id = req.scanId or "<no-id>"
-    logger.info("Processing scan %s", scan_id)
+    logger.info("Processing LiDAR scan %s", scan_id)
 
     try:
         return _run_pipeline(req)
@@ -186,6 +269,275 @@ def process(req: ProcessRequest, request: Request) -> ProcessResponse:
             error=f"Internal error: {traceback.format_exc(limit=3)}",
             timedOut=False,
         )
+
+
+def _height_field_volume_ml(
+    depth_small: np.ndarray,
+    fx: float = DEFAULT_INTRINSICS[0],
+    fy: float = DEFAULT_INTRINSICS[1],
+) -> tuple:
+    """Method 6 — height-field integration of a metric depth map.
+
+    Works for any camera angle (overhead, angled, etc.).  The background plane
+    is estimated as the 85th-percentile depth (far = table/plate) and food
+    height at each pixel is max(0, bg_z − pixel_z).  Most reliable when some
+    plate/table is visible; still returns a useful approximation otherwise.
+
+    Returns (volume_ml | None, confidence ∈ [0, 1]).
+    """
+    d = depth_small.ravel()
+    bg_z       = float(np.percentile(d, 85))
+    food_z_min = float(np.percentile(d, 5))
+    z_range    = bg_z - food_z_min          # depth relief of the food
+
+    if z_range < 0.003:                     # < 3 mm — scene too flat
+        logger.warning(
+            "Height-field: z_range=%.1f mm — scene too flat, skipping",
+            z_range * 1000,
+        )
+        return None, 0.0
+
+    height     = np.maximum(0.0, bg_z - depth_small)           # H×W, metres
+    threshold  = max(0.003, z_range * 0.05)
+    significant = height > threshold
+
+    n_sig = int(significant.sum())
+    if n_sig < 30:
+        logger.warning("Height-field: only %d significant pixels — skipping", n_sig)
+        return None, 0.0
+
+    # Pixel footprint in world space at each pixel's depth: (z/fx) × (z/fy) m²
+    pixel_area = (depth_small / fx) * (depth_small / fy)
+    vol_m3     = float(np.sum(height * pixel_area * significant))
+    vol_ml     = vol_m3 * 1_000_000.0
+
+    food_frac  = float(n_sig) / float(significant.size)
+    # Confidence: larger depth relief & food coverage → more confident (cap at 0.75)
+    confidence = float(min(0.75, z_range * 5.0 * (0.5 + food_frac)))
+
+    logger.info(
+        "Height-field (method 6): z_range=%.1f mm  food_frac=%.0f%%  → %.1f ml  conf=%.2f",
+        z_range * 1000, food_frac * 100, vol_ml, confidence,
+    )
+    return vol_ml, confidence
+
+
+def _colorize_depth_heatmap(depth_clamped: np.ndarray) -> str:
+    """Render a metric depth map as a colorized JPEG heatmap for Claude visual input.
+
+    Warm colours (red/orange) = near camera = food surface.
+    Cool colours (blue/cyan) = far from camera = plate/table background.
+
+    Uses a jet-like colormap implemented in pure numpy/PIL (no matplotlib).
+    Upsamples 64×48 → 320×240 (5× nearest-neighbor) and encodes as JPEG.
+    Returns base64-encoded JPEG string.
+    """
+    d_min = float(depth_clamped.min())
+    d_max = float(depth_clamped.max())
+    if d_max - d_min < 1e-4:
+        norm = np.zeros_like(depth_clamped, dtype=np.float32)
+    else:
+        norm = (depth_clamped - d_min) / (d_max - d_min)
+
+    # Invert: low depth (near/food) → 1.0 (warm), high depth (far/background) → 0.0 (cool)
+    d = (1.0 - norm).astype(np.float32)
+
+    # Jet-like colormap: d=1 (near/food) → red, d=0.5 → green, d=0 (far/bg) → blue
+    r = np.clip(4.0 * d - 2.0, 0.0, 1.0)
+    g = np.clip(np.minimum(4.0 * d, 4.0 - 4.0 * d), 0.0, 1.0)
+    b = np.clip(2.0 - 4.0 * d, 0.0, 1.0)
+
+    rgb = (np.stack([r, g, b], axis=-1) * 255).astype(np.uint8)
+    pil_heatmap = PILImage.fromarray(rgb, "RGB")
+    # If input is already at target size (320×240) skip the resize.
+    # If input is the 64×48 pipeline map, upscale 5× with nearest-neighbor.
+    if (pil_heatmap.width, pil_heatmap.height) != (320, 240):
+        pil_heatmap = pil_heatmap.resize((320, 240), PILImage.NEAREST)
+
+    buf = _io.BytesIO()
+    pil_heatmap.save(buf, format="JPEG", quality=75)
+    heatmap_b64 = base64.b64encode(buf.getvalue()).decode("utf-8")
+    logger.info(
+        "Depth heatmap generated: %dx%d → 320×240 JPEG, %d bytes",
+        rgb.shape[1], rgb.shape[0], len(buf.getvalue()),
+    )
+    return heatmap_b64
+
+
+@app.post("/process-photo", response_model=ProcessResponse)
+def process_photo(req: ProcessPhotoRequest, request: Request) -> ProcessResponse:
+    """Neural Depth Scan — runs Depth Anything v2 Metric Indoor on a JPEG photo,
+    produces a 64×48 metric depth map, then feeds it to the same 5-method
+    Open3D ensemble used by the LiDAR pipeline."""
+    if _SERVICE_SECRET_KEY:
+        incoming = request.headers.get("x-service-key", "")
+        if incoming != _SERVICE_SECRET_KEY:
+            return JSONResponse(status_code=401, content={"error": "Unauthorized"})
+
+    scan_id = req.scanId or "<no-id>"
+    logger.info("Processing neural depth scan %s", scan_id)
+
+    try:
+        return _process_photo_depth(req)
+    except Exception:
+        msg = traceback.format_exc()
+        logger.error("Unhandled exception in neural depth scan %s:\n%s", scan_id, msg)
+        return ProcessResponse(
+            error=f"Internal error: {traceback.format_exc(limit=3)}",
+            timedOut=False,
+        )
+
+
+def _process_photo_depth(req: ProcessPhotoRequest) -> ProcessResponse:
+    """Convert a JPEG photo → metric depth map → 5-method volume ensemble."""
+    if not DEPTH_ANYTHING_AVAILABLE:
+        return ProcessResponse(
+            error="Depth Anything v2 model not available on this server.",
+            timedOut=False,
+        )
+
+    # 1. Decode JPEG from base64
+    try:
+        img_bytes = base64.b64decode(req.imageBase64)
+        pil_img = PILImage.open(_io.BytesIO(img_bytes)).convert("RGB")
+    except Exception as e:
+        logger.error("Photo decode failed in scan %s: %s", req.scanId, e)
+        return ProcessResponse(error=f"Photo decode error: {e}", timedOut=False)
+
+    # 2. Run Depth Anything v2 Metric Indoor → float32 metres (absolute metric depth)
+    # Heatmap resolution: 320×240 — the target size for Claude's second image.
+    # We interpolate the model output directly to this resolution rather than
+    # going via the full original image size (e.g. 1366×1024) and then shrinking.
+    # Both paths give the same 64×48 pipeline input but this avoids allocating
+    # a large intermediate tensor, saving memory on the Railway container.
+    HEATMAP_W, HEATMAP_H = 320, 240
+
+    try:
+        processor, model = _get_da_model()
+        inputs = processor(images=pil_img, return_tensors="pt")
+        with torch.no_grad():
+            outputs = model(**inputs)
+            # Upsample model output directly to heatmap resolution (320×240).
+            # The processor already resized pil_img to 518×518 for the forward
+            # pass, so the original image dimensions don't affect inference time.
+            # Skipping the original-size intermediate tensor saves ~5-15 MB RAM.
+            depth_tensor = torch.nn.functional.interpolate(
+                outputs.predicted_depth.unsqueeze(1),
+                size=(HEATMAP_H, HEATMAP_W),   # (H=240, W=320)
+                mode="bicubic",
+                align_corners=False,
+            ).squeeze()  # shape: (240, 320), float32, metres
+        depth_heatmap_np = depth_tensor.cpu().numpy().astype(np.float32)
+        logger.info(
+            "Depth Anything v2 inference done. depth range: [%.4fm, %.4fm]  "
+            "mean=%.4fm  heatmap_shape=%s",
+            float(depth_heatmap_np.min()), float(depth_heatmap_np.max()),
+            float(depth_heatmap_np.mean()), depth_heatmap_np.shape,
+        )
+    except Exception as e:
+        logger.error("Depth Anything inference failed: %s", e)
+        return ProcessResponse(error=f"Depth estimation failed: {e}", timedOut=False)
+
+    # 3. Downsample 320×240 → 64×48 for the 5-method pipeline.
+    try:
+        depth_small = np.array(
+            PILImage.fromarray(depth_heatmap_np).resize(
+                (DEPTH_MAP_WIDTH, DEPTH_MAP_HEIGHT), PILImage.LANCZOS
+            ),
+            dtype=np.float32,
+        )
+    except Exception as e:
+        logger.error("Depth downsample failed: %s", e)
+        return ProcessResponse(error=f"Downsample error: {e}", timedOut=False)
+
+    # 4. Clamp pipeline map to the valid depth range (0.05–1.50 m).
+    depth_clamped = np.clip(depth_small, DEPTH_MIN_M, DEPTH_MAX_M)
+
+    # 4b. Generate colorized JPEG heatmap from the 320×240 map (better quality
+    #     than 5× upsampling the 64×48 pipeline map with nearest-neighbor).
+    #     Always produced — returned even when volume estimation fails so Claude
+    #     can use depth information for 3D visual reasoning about the food.
+    try:
+        depth_heatmap_clamped = np.clip(depth_heatmap_np, DEPTH_MIN_M, DEPTH_MAX_M)
+        heatmap_b64 = _colorize_depth_heatmap(depth_heatmap_clamped)
+    except Exception as e:
+        logger.warning("Heatmap generation failed (non-fatal): %s", e)
+        heatmap_b64 = None
+
+    # 5. Encode as uint8 [1–255] — the same byte format as the ARKit compact depth map.
+    #    byte = 0 means "invalid"; all monocular pixels are valid so we map to [1, 255].
+    byte_array = np.clip(
+        np.round(1.0 + (depth_clamped - DEPTH_MIN_M) / DEPTH_RANGE_M * 254.0)
+        .astype(np.uint8),
+        1,
+        255,
+    )
+
+    # 6. Height-field volume (method 6) — works for any camera angle.
+    #    Computed here before encoding so we have the float32 map available.
+    hf_vol_ml, hf_conf = _height_field_volume_ml(depth_clamped)
+
+    # 7. Encode as uint8 and hand off to the 5-method pipeline.
+    depth_b64 = base64.b64encode(byte_array.tobytes()).decode("utf-8")
+    synthetic_req = ProcessRequest(
+        depthMapBase64=depth_b64,
+        intrinsics=None,   # use DEFAULT_INTRINSICS — correct for a phone at 20–60 cm
+        scanId=req.scanId,
+        category=req.category,
+    )
+    logger.info(
+        "Neural depth scan %s → depth clamped [%.3fm, %.3fm], forwarding to pipeline",
+        req.scanId or "<no-id>",
+        float(depth_clamped.min()),
+        float(depth_clamped.max()),
+    )
+    result = _run_pipeline(synthetic_req)
+
+    # Augment the method breakdown with the height-field result regardless.
+    breakdown = dict(result.methodBreakdown)
+    if hf_vol_ml is not None:
+        breakdown["height_field"] = round(hf_vol_ml, 2)
+
+    # If the 5-method pipeline failed but height-field succeeded, use it as
+    # the final volume with a transparency note in the breakdown.
+    if result.error and hf_vol_ml is not None and 10.0 < hf_vol_ml < 8000.0:
+        logger.info(
+            "5-method pipeline failed (%s) — using height-field fallback: %.1f ml",
+            result.error, hf_vol_ml,
+        )
+        wt_g, wt_cat = _estimate_weight(hf_vol_ml, req.category)
+        return ProcessResponse(
+            volumeMl=hf_vol_ml,
+            methodBreakdown=breakdown,
+            confidence=hf_conf,
+            estimatedWeightG=wt_g,
+            regressionCategory=wt_cat,
+            depthRawBase64=depth_b64,
+            depthHeatmapBase64=heatmap_b64,
+            timedOut=False,
+            # Iteration 14 Layer 6 — height-field fallback path: divergence is
+            # n/a (single-method estimate). Leave None so the client's prompt
+            # treats the volume as un-cross-validated.
+        )
+
+    # 8. Return pipeline result (success or hard failure).
+    # Include compact depth bytes and the colorized heatmap.
+    # depthHeatmapBase64 is always included so the client can pass it to Claude
+    # as a second image even when volumeMl is None (volume estimation failed).
+    return ProcessResponse(
+        volumeMl=result.volumeMl,
+        methodBreakdown=breakdown,
+        confidence=result.confidence,
+        plyBase64=result.plyBase64,
+        estimatedWeightG=result.estimatedWeightG,
+        regressionCategory=result.regressionCategory,
+        error=result.error,
+        timedOut=result.timedOut,
+        depthRawBase64=depth_b64,
+        depthHeatmapBase64=heatmap_b64,
+        # Iteration 14 Layer 6 — propagate divergence from the 5-method pipeline.
+        divergence=result.divergence,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -266,7 +618,9 @@ def _run_pipeline(req: ProcessRequest) -> ProcessResponse:
     breakdown["poisson"]  = round(m_poisson,  2) if m_poisson  is not None else None
 
     # 6. Paper ensemble: confidence = exp(−σ/μ)
-    valid = {k: v for k, v in breakdown.items() if v is not None and 40.0 < v < 1600.0}
+    # Range widened from 40–1600 ml: LiDAR large-plate and neural overhead shots
+    # can legitimately produce volumes > 1600 ml (e.g. whole pizza, large bowl).
+    valid = {k: v for k, v in breakdown.items() if v is not None and 10.0 < v < 8000.0}
 
     if not valid:
         return ProcessResponse(
@@ -281,13 +635,36 @@ def _run_pipeline(req: ProcessRequest) -> ProcessResponse:
     cv        = sigma / mu if mu > 0 else 1.0
     confidence = float(np.exp(-cv))   # paper formula
 
-    # Paper's selection rule
+    # Iteration 14 Layer 6 — analog to LiDAR build 134's hull-drop. Convex
+    # hull tends to over-estimate when food sits in a bowl-shaped plate
+    # (wraps the rim's depth shadow). Move convex out of the primary
+    # selection path: prefer poisson at high confidence, otherwise trimmed
+    # mean of the non-convex methods. Convex stays as last-resort fallback
+    # if no other method produced a valid estimate.
+    non_convex_valid = {k: v for k, v in valid.items() if k != "convex"}
     if confidence >= 0.8 and valid.get("poisson") is not None:
         final_vol = float(valid["poisson"])
+    elif len(non_convex_valid) >= 3:
+        # Trimmed mean — drop highest and lowest of the non-convex methods.
+        # Same rationale as LiDAR's trimmed-mean ensemble: stable to a single
+        # method blowing up.
+        nc_vals = sorted(non_convex_valid.values())
+        final_vol = float(np.mean(nc_vals[1:-1]))
+    elif non_convex_valid:
+        final_vol = float(np.mean(list(non_convex_valid.values())))
     elif valid.get("convex") is not None:
+        # Last resort — only convex produced a valid estimate
         final_vol = float(valid["convex"])
     else:
         final_vol = mu
+
+    # Iteration 14 Layer 6 — divergence signal across all valid methods. Same
+    # semantic as LiDAR's divergence (max - min) / max. Returned to the client
+    # so the prompt-builder fires the existing ENSEMBLE AGREEMENT / DIVERGENCE
+    # language (built for LiDAR; now applies to Neural Depth too).
+    divergence_val: Optional[float] = None
+    if vals and max(vals) > 0:
+        divergence_val = float((max(vals) - min(vals)) / max(vals))
 
     # Clamp confidence if we had very few food points
     if low_pt_flag:
@@ -300,12 +677,13 @@ def _run_pipeline(req: ProcessRequest) -> ProcessResponse:
     ply_b64 = _export_ply_base64(food_pts)
 
     logger.info(
-        "Scan %s → vol=%.1f ml conf=%.2f methods=%d/%d%s",
+        "Scan %s → vol=%.1f ml conf=%.2f methods=%d/%d divergence=%s%s",
         req.scanId or "<no-id>",
         final_vol,
         confidence,
         len(valid),
         5,
+        f"{divergence_val:.2f}" if divergence_val is not None else "n/a",
         f" weight={weight_g}g ({matched_cat})" if weight_g else "",
     )
 
@@ -316,6 +694,7 @@ def _run_pipeline(req: ProcessRequest) -> ProcessResponse:
         plyBase64=ply_b64,
         estimatedWeightG=weight_g,
         regressionCategory=matched_cat,
+        divergence=round(divergence_val, 4) if divergence_val is not None else None,
     )
 
 
